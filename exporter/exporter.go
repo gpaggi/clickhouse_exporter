@@ -26,6 +26,7 @@ type Exporter struct {
 	asyncMetricsURI string
 	eventsURI       string
 	partsURI        string
+	replicasURI     string
 	client          *http.Client
 
 	scrapeFailures prometheus.Counter
@@ -52,12 +53,19 @@ func NewExporter(uri url.URL, insecure bool, user, password string) *Exporter {
 	partsURI := uri
 	q.Set("query", "select database, table, sum(bytes) as bytes, count() as parts, sum(rows) as rows from system.parts where active = 1 group by database, table")
 	partsURI.RawQuery = q.Encode()
-	
+
+	replicasURI := uri
+	q.Set("query", `select database, table, total_replicas, active_replicas,
+		queue_size, future_parts, parts_to_check, inserts_in_queue, merges_in_queue, is_readonly, columns_version, log_max_index, log_pointer
+		from system.replicas`)
+	replicasURI.RawQuery = q.Encode()
+
 	return &Exporter{
 		metricsURI:      metricsURI.String(),
 		asyncMetricsURI: asyncMetricsURI.String(),
 		eventsURI:       eventsURI.String(),
 		partsURI:        partsURI.String(),
+		replicasURI:     replicasURI.String(),
 		scrapeFailures: prometheus.NewCounter(prometheus.CounterOpts{
 			Namespace: namespace,
 			Name:      "exporter_scrape_failures_total",
@@ -172,6 +180,101 @@ func (e *Exporter) collect(ch chan<- prometheus.Metric) error {
 		newRowsMetric.Collect(ch)
 	}
 
+	replicas, err := e.parseReplicasResponse(e.replicasURI)
+	if err != nil {
+		return fmt.Errorf("Error scraping clickhouse url %v: %v", e.eventsURI, err)
+	}
+
+	for _, rp := range replicas {
+		newActiveCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_active_count",
+			Help:      "Number of active replicas for the table",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newActiveCountMetric.Set(float64(rp.activeReplicas))
+		newActiveCountMetric.Collect(ch)
+
+		newTotalCountMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_total_count",
+			Help:      "Number of replicas configured for the table",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newTotalCountMetric.Set(float64(rp.totalReplicas))
+		newTotalCountMetric.Collect(ch)
+
+		newQueueMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_queue_size",
+			Help:      "Size of the queue for operations waiting to be performed. Operations include inserting blocks of data, merges, and certain other actions",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newQueueMetric.Set(float64(rp.queueSize))
+		newQueueMetric.Collect(ch)
+
+		newFuturePartsMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_future_parts",
+			Help:      "The number of data parts that will appear as the result of INSERTs or merges that haven't been done yet",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newFuturePartsMetric.Set(float64(rp.futureParts))
+		newFuturePartsMetric.Collect(ch)
+
+		newPartsToCheckMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_parts_to_check",
+			Help:      "The number of data parts in the queue for verification",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newPartsToCheckMetric.Set(float64(rp.partsToCheck))
+		newPartsToCheckMetric.Collect(ch)
+
+		newInsertsInQueueMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_inserts_in_queue",
+			Help:      "Number of inserts of blocks of data that need to be made",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newInsertsInQueueMetric.Set(float64(rp.insertsInQueue))
+		newInsertsInQueueMetric.Collect(ch)
+
+		newMergesInQueueMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_merges_in_queue",
+			Help:      "The number of merges waiting to be made",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newMergesInQueueMetric.Set(float64(rp.mergesInQueue))
+		newMergesInQueueMetric.Collect(ch)
+
+		newIsReadonlyMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_is_readonly",
+			Help:      "Whether the replica is in read-only mode",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newIsReadonlyMetric.Set(float64(rp.isReadonly))
+		newIsReadonlyMetric.Collect(ch)
+
+		newColumnsVersionMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_columns_version",
+			Help:      "Version number of the table structure",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newColumnsVersionMetric.Set(float64(rp.columnsVersion))
+		newColumnsVersionMetric.Collect(ch)
+
+		newLogMaxIndexMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_log_max_index",
+			Help:      "Index of head of replication log",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newLogMaxIndexMetric.Set(float64(rp.logMaxIndex))
+		newLogMaxIndexMetric.Collect(ch)
+
+		newLogPointerIndexMetric := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: namespace,
+			Name:      "replicas_log_pointer",
+			Help:      "Index of current position in the replication log",
+		}, []string{"database", "table"}).WithLabelValues(rp.database, rp.table)
+		newLogPointerIndexMetric.Set(float64(rp.logPointer))
+		newLogPointerIndexMetric.Collect(ch)
+	}
+
 	return nil
 }
 
@@ -197,7 +300,7 @@ func (e *Exporter) handleResponse(uri string) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("Status %s (%d): %s", resp.Status, resp.StatusCode, data)
 	}
-	
+
 	return data, nil
 }
 
@@ -214,7 +317,7 @@ func (e *Exporter) parseKeyValueResponse(uri string) ([]lineResult, error) {
 
 	// Parsing results
 	lines := strings.Split(string(data), "\n")
-	var results []lineResult = make([]lineResult, 0)
+	var results = make([]lineResult, 0)
 
 	for i, line := range lines {
 		parts := strings.Fields(line)
@@ -251,7 +354,7 @@ func (e *Exporter) parsePartsResponse(uri string) ([]partsResult, error) {
 
 	// Parsing results
 	lines := strings.Split(string(data), "\n")
-	var results []partsResult = make([]partsResult, 0)
+	var results = make([]partsResult, 0)
 
 	for i, line := range lines {
 		parts := strings.Fields(line)
@@ -280,6 +383,106 @@ func (e *Exporter) parsePartsResponse(uri string) ([]partsResult, error) {
 		}
 
 		results = append(results, partsResult{database, table, bytes, count, rows})
+	}
+
+	return results, nil
+}
+
+type replicasResult struct {
+	database       string
+	table          string
+	totalReplicas  int
+	activeReplicas int
+	queueSize      int
+	futureParts    int
+	partsToCheck   int
+	insertsInQueue int
+	mergesInQueue  int
+	isReadonly     int
+	columnsVersion int
+	logMaxIndex    int
+	logPointer     int
+}
+
+func (e *Exporter) parseReplicasResponse(uri string) ([]replicasResult, error) {
+	data, err := e.handleResponse(uri)
+	if err != nil {
+		return nil, err
+	}
+
+	// Parsing results
+	lines := strings.Split(string(data), "\n")
+	var results = make([]replicasResult, 0)
+
+	for i, line := range lines {
+		replicas := strings.Fields(line)
+		if len(replicas) == 0 {
+			continue
+		}
+		if len(replicas) != 13 {
+			return nil, fmt.Errorf("parsePartsResponse: unexpected %d line: %s", i, line)
+		}
+		database := strings.TrimSpace(replicas[0])
+		table := strings.TrimSpace(replicas[1])
+
+		totalReplicas, err := strconv.Atoi(strings.TrimSpace(replicas[2]))
+		if err != nil {
+			return nil, err
+		}
+
+		activeReplicas, err := strconv.Atoi(strings.TrimSpace(replicas[3]))
+		if err != nil {
+			return nil, err
+		}
+
+		queueSize, err := strconv.Atoi(strings.TrimSpace(replicas[4]))
+		if err != nil {
+			return nil, err
+		}
+
+		futureParts, err := strconv.Atoi(strings.TrimSpace(replicas[5]))
+		if err != nil {
+			return nil, err
+		}
+
+		partsToCheck, err := strconv.Atoi(strings.TrimSpace(replicas[6]))
+		if err != nil {
+			return nil, err
+		}
+
+		insertsInQueue, err := strconv.Atoi(strings.TrimSpace(replicas[7]))
+		if err != nil {
+			return nil, err
+		}
+
+		mergesInQueue, err := strconv.Atoi(strings.TrimSpace(replicas[8]))
+		if err != nil {
+			return nil, err
+		}
+
+		isReadonly, err := strconv.Atoi(strings.TrimSpace(replicas[9]))
+		if err != nil {
+			return nil, err
+		}
+
+		columnsVersion, err := strconv.Atoi(strings.TrimSpace(replicas[10]))
+		if err != nil {
+			return nil, err
+		}
+
+		logMaxIndex, err := strconv.Atoi(strings.TrimSpace(replicas[11]))
+		if err != nil {
+			return nil, err
+		}
+
+		logPointer, err := strconv.Atoi(strings.TrimSpace(replicas[12]))
+		if err != nil {
+			return nil, err
+		}
+
+		results = append(results, replicasResult{database, table, totalReplicas, activeReplicas,
+			queueSize, futureParts, partsToCheck, insertsInQueue, mergesInQueue, isReadonly, columnsVersion,
+			logMaxIndex, logPointer})
 	}
 
 	return results, nil
